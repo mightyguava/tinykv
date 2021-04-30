@@ -182,6 +182,7 @@ func newRaft(c *Config) *Raft {
 		votes:            make(map[uint64]bool),
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
+		RaftLog:          newLog(c.Storage),
 	}
 	r.reset(0)
 	return r
@@ -251,65 +252,103 @@ func (r *Raft) Step(m pb.Message) error {
 		if m.MsgType == pb.MessageType_MsgHeartbeat {
 			// Heartbeat received from leader with a lower term. Reply with a message to "disrupt" the leader to
 			// become a follower.
-			r.msgs = append(r.msgs, pb.Message{From: r.id, To: m.From, Term: r.Term, MsgType: pb.MessageType_MsgAppendResponse})
+			r.send(pb.Message{To: m.From, Term: r.Term, MsgType: pb.MessageType_MsgAppendResponse})
 		}
 	}
-	switch m.MsgType {
-	case pb.MessageType_MsgHeartbeat:
-	case pb.MessageType_MsgAppend:
-	}
-
+	var err error
 	switch r.State {
 	case StateFollower:
-		switch m.MsgType {
-		case pb.MessageType_MsgAppend:
-			r.Term = m.Term
-		case pb.MessageType_MsgHup:
-			r.startElection()
-		case pb.MessageType_MsgRequestVote:
-			r.vote(m)
-		}
+		err = r.stepFollower(m)
 	case StateCandidate:
-		switch m.MsgType {
-		case pb.MessageType_MsgHup:
-			r.startElection()
-		case pb.MessageType_MsgRequestVoteResponse:
-			if m.Reject {
-				log.Infof("%x rejected vote", m.From)
-			}
-			r.votes[m.From] = !m.Reject
-			if r.tallyVotes() {
-				r.becomeLeader()
-			}
-		case pb.MessageType_MsgAppend:
-			if m.Term >= r.Term {
-				r.becomeFollower(m.Term, m.From)
-			}
-		case pb.MessageType_MsgRequestVote:
-			r.vote(m)
-		}
+		err = r.stepCandidate(m)
 	case StateLeader:
-		switch m.MsgType {
-		case pb.MessageType_MsgBeat:
-			for pr := range r.Prs {
-				if pr == r.id {
-					continue
-				}
-				r.msgs = append(r.msgs, pb.Message{From: r.id, To: pr, Term: r.Term, MsgType: pb.MessageType_MsgHeartbeat})
-			}
-		case pb.MessageType_MsgAppend:
-			if m.Term > r.Term {
-				r.becomeFollower(m.Term, m.From)
-			}
-		case pb.MessageType_MsgAppendResponse:
-			if m.Term > r.Term {
-				r.becomeFollower(m.Term, m.From)
-			}
-		case pb.MessageType_MsgRequestVote:
-			r.vote(m)
-		}
+		err = r.stepLeader(m)
+	}
+	return err
+}
+
+func (r *Raft) stepFollower(m pb.Message) error {
+	switch m.MsgType {
+	case pb.MessageType_MsgAppend:
+		r.Term = m.Term
+		r.RaftLog.append()
+	case pb.MessageType_MsgHup:
+		r.startElection()
+	case pb.MessageType_MsgRequestVote:
+		r.vote(m)
 	}
 	return nil
+}
+
+func (r *Raft) stepCandidate(m pb.Message) error {
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		r.startElection()
+	case pb.MessageType_MsgRequestVoteResponse:
+		if m.Reject {
+			log.Infof("%x rejected vote", m.From)
+		}
+		r.votes[m.From] = !m.Reject
+		if r.tallyVotes() {
+			r.becomeLeader()
+		}
+	case pb.MessageType_MsgAppend:
+		if m.Term >= r.Term {
+			r.becomeFollower(m.Term, m.From)
+		}
+	case pb.MessageType_MsgRequestVote:
+		r.vote(m)
+	}
+	return nil
+}
+
+func (r *Raft) stepLeader(m pb.Message) error {
+	switch m.MsgType {
+	case pb.MessageType_MsgBeat:
+		r.broadcast(pb.Message{MsgType: pb.MessageType_MsgHeartbeat})
+	case pb.MessageType_MsgAppend:
+		if m.Term > r.Term {
+			r.becomeFollower(m.Term, m.From)
+		}
+	case pb.MessageType_MsgAppendResponse:
+		if m.Term > r.Term {
+			r.becomeFollower(m.Term, m.From)
+		}
+	case pb.MessageType_MsgRequestVote:
+		r.vote(m)
+	case pb.MessageType_MsgPropose:
+		entries := make([]pb.Entry, 0, len(m.Entries))
+		index := r.RaftLog.LastIndex() + 1
+		for _, ptr := range m.Entries {
+			ptr.Term = r.Term
+			ptr.Index = index
+			index++
+			entries = append(entries, *ptr)
+		}
+		r.RaftLog.append(entries...)
+		r.broadcast(pb.Message{LogTerm: r.Term, Entries: m.Entries, MsgType: pb.MessageType_MsgAppend})
+	}
+	return nil
+}
+
+func (r *Raft) broadcast(msg pb.Message) {
+	for pr := range r.Prs {
+		if pr == r.id {
+			continue
+		}
+		msg.To = pr
+		r.send(msg)
+	}
+}
+
+func (r *Raft) send(msg pb.Message) {
+	if msg.From == 0 {
+		msg.From = r.id
+	}
+	if msg.Term == 0 {
+		msg.Term = r.Term
+	}
+	r.msgs = append(r.msgs, msg)
 }
 
 func (r *Raft) startElection() {
@@ -318,12 +357,7 @@ func (r *Raft) startElection() {
 	r.votes[r.id] = true
 	r.Vote = r.id
 	log.Infof("%x starting campaign for term %d", r.id, r.Term)
-	for pr := range r.Prs {
-		if pr == r.id {
-			continue
-		}
-		r.msgs = append(r.msgs, pb.Message{From: r.id, To: pr, Term: r.Term, MsgType: pb.MessageType_MsgRequestVote})
-	}
+	r.broadcast(pb.Message{MsgType: pb.MessageType_MsgRequestVote})
 	if r.tallyVotes() {
 		r.becomeLeader()
 	}
@@ -338,7 +372,7 @@ func (r *Raft) vote(m pb.Message) {
 		r.Term = m.Term
 		r.Vote = m.From
 	}
-	r.msgs = append(r.msgs, pb.Message{From: r.id, To: m.From, Term: m.Term, Reject: reject, MsgType: pb.MessageType_MsgRequestVoteResponse})
+	r.send(pb.Message{To: m.From, Reject: reject, MsgType: pb.MessageType_MsgRequestVoteResponse})
 }
 
 func (r *Raft) reset(term uint64) {
