@@ -14,7 +14,12 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	"errors"
+
+	"github.com/pingcap-incubator/tinykv/log"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -50,6 +55,8 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	// the first index after the snapshot
+	firstIndex uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -64,10 +71,11 @@ func newLog(storage Storage) *RaftLog {
 		panic(err)
 	}
 	return &RaftLog{
-		storage:   storage,
-		applied:   firstIndex - 1,
-		committed: firstIndex - 1,
-		stabled:   lastIndex,
+		storage:    storage,
+		firstIndex: firstIndex,
+		applied:    firstIndex - 1,
+		committed:  firstIndex - 1,
+		stabled:    lastIndex,
 	}
 }
 
@@ -84,18 +92,67 @@ func (l *RaftLog) maybeCompact() {
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-	return l.entries
+	numUnstable := l.LastIndex() - l.stabled
+	total := len(l.entries)
+	ents := l.entries[total-int(numUnstable) : total]
+	return ents
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
-	// Your Code Here (2A).
-	return nil
+	ents, err := l.slice(max(l.applied+1, l.firstIndex), l.committed+1)
+	if err != nil {
+		log.Panicf("error fetching next entries: %v", err)
+	}
+	return ents
+}
+
+func (l *RaftLog) entriesFrom(lo uint64) ([]pb.Entry, error) {
+	li := l.LastIndex()
+	if lo > li {
+		return nil, nil
+	}
+	return l.slice(lo, li+1)
+}
+
+// slice returns a slice of the array reading from both stable and unstable logs, from lo to hi-1, inclusive
+func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
+	if hi > l.LastIndex()+1 || lo < l.firstIndex {
+		return nil, errors.New("out of bounds")
+	}
+	if lo == hi {
+		return nil, nil
+	}
+	var ents []pb.Entry
+	if lo <= l.stabled {
+		entries, err := l.storage.Entries(lo, l.stabled+1)
+		if err != nil {
+			return nil, err
+		}
+		ents = entries
+		lo = l.stabled + 1
+	}
+	if hi > l.stabled+1 {
+		unstable := l.entries[lo-l.entries[0].Index : hi-l.entries[0].Index]
+		ents = append(ents, unstable...)
+	}
+	return ents, nil
+}
+
+func (l *RaftLog) commit(index uint64) {
+	l.committed = index
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
-	return l.stabled + uint64(len(l.entries))
+	if l.entries != nil {
+		return l.entries[len(l.entries)-1].Index
+	}
+	idx, err := l.storage.LastIndex()
+	if err != nil {
+		panic(err)
+	}
+	return idx
 }
 
 // Term return the term of the entry in the given index

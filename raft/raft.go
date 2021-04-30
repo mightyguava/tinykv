@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 	"math/rand"
+	"sort"
 
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
@@ -173,7 +174,7 @@ func newRaft(c *Config) *Raft {
 	}
 	prs := make(map[uint64]*Progress)
 	for _, p := range c.peers {
-		prs[p] = nil
+		prs[p] = &Progress{}
 	}
 	r := &Raft{
 		id:               c.ID,
@@ -235,6 +236,8 @@ func (r *Raft) becomeLeader() {
 	log.Infof("%x becoming leader", r.id)
 	r.State = StateLeader
 	r.Lead = r.id
+	// Leader creates a noop entry when starting a new term
+	r.leaderAppendEntries(&pb.Entry{})
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -271,7 +274,7 @@ func (r *Raft) stepFollower(m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgAppend:
 		r.Term = m.Term
-		r.RaftLog.append()
+		r.handleAppendEntries(m)
 	case pb.MessageType_MsgHup:
 		r.startElection()
 	case pb.MessageType_MsgRequestVote:
@@ -306,29 +309,27 @@ func (r *Raft) stepLeader(m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgBeat:
 		r.broadcast(pb.Message{MsgType: pb.MessageType_MsgHeartbeat})
-	case pb.MessageType_MsgAppend:
-		if m.Term > r.Term {
-			r.becomeFollower(m.Term, m.From)
-		}
 	case pb.MessageType_MsgAppendResponse:
-		if m.Term > r.Term {
-			r.becomeFollower(m.Term, m.From)
-		}
+		r.Prs[m.From].Match = m.Index
+		r.maybeCommit()
 	case pb.MessageType_MsgRequestVote:
 		r.vote(m)
 	case pb.MessageType_MsgPropose:
-		entries := make([]pb.Entry, 0, len(m.Entries))
-		index := r.RaftLog.LastIndex() + 1
-		for _, ptr := range m.Entries {
-			ptr.Term = r.Term
-			ptr.Index = index
-			index++
-			entries = append(entries, *ptr)
-		}
-		r.RaftLog.append(entries...)
-		r.broadcast(pb.Message{LogTerm: r.Term, Entries: m.Entries, MsgType: pb.MessageType_MsgAppend})
+		r.leaderAppendEntries(m.Entries...)
 	}
 	return nil
+}
+
+func (r *Raft) leaderAppendEntries(entries ...*pb.Entry) {
+	index := r.RaftLog.LastIndex()
+	for i := range entries {
+		entries[i].Term = r.Term
+		entries[i].Index = index + uint64(i) + 1
+	}
+	r.RaftLog.append(entriesToValue(entries)...)
+	r.Prs[r.id].Match = index
+	r.broadcast(pb.Message{LogTerm: r.Term, Index: index, Commit: r.RaftLog.committed, Entries: entries, MsgType: pb.MessageType_MsgAppend})
+	r.maybeCommit()
 }
 
 func (r *Raft) broadcast(msg pb.Message) {
@@ -397,9 +398,28 @@ func (r *Raft) tallyVotes() bool {
 	return count >= required
 }
 
+func (r *Raft) maybeCommit() {
+	// Find the smallest index that has been replicated to a quorum of nodes.
+	minReplicated := uint64(0)
+	quorum := len(r.Prs)/2 + 1
+	index := make([]uint64, 0, len(r.Prs)-1)
+	for _, prg := range r.Prs {
+		index = append(index, prg.Match)
+	}
+	sort.Slice(index, func(i, j int) bool {
+		return index[i] < index[j]
+	})
+	minReplicated = index[len(index)-quorum]
+	if minReplicated > r.RaftLog.committed {
+		r.RaftLog.commit(minReplicated)
+	}
+}
+
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
+	r.RaftLog.append(entriesToValue(m.Entries)...)
+	r.send(pb.Message{To: r.Lead, MsgType: pb.MessageType_MsgAppendResponse})
 }
 
 // handleHeartbeat handle Heartbeat RPC request
@@ -420,4 +440,20 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+func entriesToPtr(r []pb.Entry) []*pb.Entry {
+	ptr := make([]*pb.Entry, len(r))
+	for i, e := range r {
+		ptr[i] = &e
+	}
+	return ptr
+}
+
+func entriesToValue(ptr []*pb.Entry) []pb.Entry {
+	r := make([]pb.Entry, len(ptr))
+	for i, e := range ptr {
+		r[i] = *e
+	}
+	return r
 }
