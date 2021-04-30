@@ -189,10 +189,30 @@ func newRaft(c *Config) *Raft {
 	return r
 }
 
+// bcastAppend sends an append RPC to each peer
+func (r *Raft) bcastAppend() {
+	for pr := range r.Prs {
+		if pr == r.id {
+			continue
+		}
+		r.sendAppend(pr)
+	}
+}
+
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
-	// Your Code Here (2A).
+	next := r.Prs[to].Match + 1
+	ents, err := r.RaftLog.entriesFrom(next)
+	if err != nil {
+		log.Panicf("failed to get entries to send: %v", err)
+	}
+	// LogTerm and Index sent are those of the entry immediately preceding this batch
+	term, err := r.RaftLog.Term(next - 1)
+	if err != nil {
+		log.Panicf("failed to get log term: %v", err)
+	}
+	r.send(pb.Message{To: to, Term: r.Term, LogTerm: term, Index: next - 1, Commit: r.RaftLog.committed, Entries: entriesToPtr(ents), MsgType: pb.MessageType_MsgAppend})
 	return false
 }
 
@@ -316,6 +336,7 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		r.vote(m)
 	case pb.MessageType_MsgPropose:
 		r.leaderAppendEntries(m.Entries...)
+		r.bcastAppend()
 	}
 	return nil
 }
@@ -327,8 +348,7 @@ func (r *Raft) leaderAppendEntries(entries ...*pb.Entry) {
 		entries[i].Index = index + uint64(i) + 1
 	}
 	r.RaftLog.append(entriesToValue(entries)...)
-	r.Prs[r.id].Match = index
-	r.broadcast(pb.Message{LogTerm: r.Term, Index: index, Commit: r.RaftLog.committed, Entries: entries, MsgType: pb.MessageType_MsgAppend})
+	r.Prs[r.id].Match = entries[len(entries)-1].Index
 	r.maybeCommit()
 }
 
@@ -419,7 +439,7 @@ func (r *Raft) maybeCommit() {
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
 	r.RaftLog.append(entriesToValue(m.Entries)...)
-	r.send(pb.Message{To: r.Lead, MsgType: pb.MessageType_MsgAppendResponse})
+	r.send(pb.Message{To: r.Lead, Index: r.RaftLog.LastIndex(), MsgType: pb.MessageType_MsgAppendResponse})
 }
 
 // handleHeartbeat handle Heartbeat RPC request

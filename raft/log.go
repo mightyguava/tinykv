@@ -157,6 +157,15 @@ func (l *RaftLog) LastIndex() uint64 {
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	// Your Code Here (2A).
-	return 0, nil
+	if i < l.firstIndex-1 {
+		return 0, errors.New("invalid index for term")
+	}
+	if i == l.firstIndex-1 {
+		return 0, nil
+	}
+	ent, err := l.slice(i, i+1)
+	if err != nil {
+		return 0, err
+	}
+	return ent[0].Term, nil
 }
