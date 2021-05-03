@@ -47,7 +47,8 @@ type RaftLog struct {
 	// Everytime handling `Ready`, the unstabled logs will be included.
 	stabled uint64
 
-	// all entries that have not yet compact.
+	// all entries that have not yet compact. This includes both stable and
+	// unstable entries.
 	entries []pb.Entry
 
 	// the incoming unstable snapshot, if any.
@@ -70,15 +71,22 @@ func newLog(storage Storage) *RaftLog {
 	if err != nil {
 		panic(err)
 	}
+	ents, err := storage.Entries(firstIndex, lastIndex+1)
+	if err != nil {
+		panic(err)
+	}
 	return &RaftLog{
 		storage:    storage,
 		firstIndex: firstIndex,
 		applied:    firstIndex - 1,
 		committed:  firstIndex - 1,
 		stabled:    lastIndex,
+		entries:    ents,
 	}
 }
 
+// append entries into the log, skipping entries that already exist (term and index match). If there is a term mismatch,
+// all existing entries after the mismatch, inclusive, are discarded, and replaced with the new entries.
 func (l *RaftLog) append(entries ...pb.Entry) {
 	l.entries = append(l.entries, entries...)
 }
@@ -89,11 +97,51 @@ func (l *RaftLog) maybeAppend(prevLogIndex, prevLogTerm, leaderCommit uint64, en
 	if term, err := l.Term(prevLogIndex); err != nil || term != prevLogTerm {
 		return 0, false
 	}
-	l.entries = append(l.entries, entries...)
+
+	// If an existing entry conflicts with a new one (same index
+	// but different terms), delete the existing entry and all that
+	// follow it (§5.3)
+
+	// Find index of the first conflict, or if there are no conflicts
+	conflictingIndex := l.findFirstConflict(entries...)
+	if conflictingIndex == 0 {
+		// all entries are already in the log, do nothing
+	} else if conflictingIndex <= l.committed {
+		log.Panicf("entry %d conflict with committed entry [committed(%d)]", conflictingIndex, l.committed)
+	} else {
+		var err error
+		if conflictingIndex <= l.LastIndex() {
+			// there is a conflict, truncate
+			l.entries, err = l.slice(l.firstIndex, conflictingIndex)
+			l.stabled = conflictingIndex - 1
+		}
+		if err != nil {
+			log.Panicf("error getting entries: %v", err)
+		}
+		// append the new entries
+		toAdd := entries[conflictingIndex-entries[0].Index:]
+		l.entries = append(l.entries, toAdd...)
+	}
+
+	// If leaderCommit > commitIndex, set commitIndex =
+	// min(leaderCommit, index of last new entry)
 	if l.committed < leaderCommit {
-		l.commit(leaderCommit)
+		l.commit(min(leaderCommit, entries[len(entries)-1].Index))
 	}
 	return l.LastIndex(), true
+}
+
+func (l *RaftLog) findFirstConflict(entries ...pb.Entry) uint64 {
+	for i := 0; i < len(entries); i++ {
+		term, err := l.Term(entries[i].Index)
+		if err != nil || term != entries[i].Term {
+			if entries[i].Index <= l.LastIndex() {
+				log.Infof("found conflict at index %d [existing term: %d, conflicting term: %d]", entries[i].Index, term, entries[i].Term)
+			}
+			return entries[i].Index
+		}
+	}
+	return 0
 }
 
 // We need to compact the log entries in some point of time like
@@ -144,20 +192,7 @@ func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
 	if lo == hi {
 		return nil, nil
 	}
-	var ents []pb.Entry
-	if lo <= l.stabled {
-		entries, err := l.storage.Entries(lo, l.stabled+1)
-		if err != nil {
-			return nil, err
-		}
-		ents = entries
-		lo = l.stabled + 1
-	}
-	if hi > l.stabled+1 {
-		unstable := l.entries[lo-l.entries[0].Index : hi-l.entries[0].Index]
-		ents = append(ents, unstable...)
-	}
-	return ents, nil
+	return l.entries[lo-l.entries[0].Index : hi-l.entries[0].Index], nil
 }
 
 func (l *RaftLog) commit(index uint64) {
@@ -166,7 +201,7 @@ func (l *RaftLog) commit(index uint64) {
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
-	if l.entries != nil {
+	if len(l.entries) > 0 {
 		return l.entries[len(l.entries)-1].Index
 	}
 	idx, err := l.storage.LastIndex()
