@@ -176,6 +176,10 @@ func newRaft(c *Config) *Raft {
 	for _, p := range c.peers {
 		prs[p] = &Progress{}
 	}
+	hardState, _, err := c.Storage.InitialState()
+	if err != nil {
+		panic(err)
+	}
 	r := &Raft{
 		id:               c.ID,
 		Prs:              prs,
@@ -186,6 +190,9 @@ func newRaft(c *Config) *Raft {
 		RaftLog:          newLog(c.Storage),
 	}
 	r.reset(0)
+	r.Term = hardState.Term
+	r.Vote = hardState.Vote
+	r.RaftLog.committed = hardState.Commit
 	return r
 }
 
@@ -213,8 +220,20 @@ func (r *Raft) sendAppend(to uint64) bool {
 	return false
 }
 
+func (r *Raft) bcastHeartbeat() {
+	for pr := range r.Prs {
+		if pr == r.id {
+			continue
+		}
+		r.sendHeartbeat(pr)
+	}
+}
+
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
+	li := r.RaftLog.LastIndex()
+	term := r.RaftLog.mustTerm(li)
+	r.send(pb.Message{To: to, Term: r.Term, LogTerm: term, Index: li, Commit: r.RaftLog.committed, MsgType: pb.MessageType_MsgHeartbeat})
 }
 
 // tick advances the internal logical clock by a single tick.
@@ -236,7 +255,7 @@ func (r *Raft) tick() {
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
-	log.Infof("%x becoming follower, new leader %x term %d", r.id, lead, term)
+	log.Infof("%x becoming follower, new leader %x vote %x term %d", r.id, lead, r.Vote, term)
 	r.reset(term)
 	r.Lead = lead
 }
@@ -325,7 +344,7 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 func (r *Raft) stepLeader(m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgBeat:
-		r.broadcast(pb.Message{MsgType: pb.MessageType_MsgHeartbeat})
+		r.bcastHeartbeat()
 	case pb.MessageType_MsgAppendResponse:
 		r.Prs[m.From].Match = m.Index
 		r.Prs[m.From].Next = m.Index + 1
@@ -389,7 +408,7 @@ func (r *Raft) startElection() {
 func (r *Raft) vote(m pb.Message) {
 	reject := false
 	if m.Term < r.Term || // Reject if the message has a lower term ...
-		m.Term == r.Term && r.Vote != m.From && r.Vote != None || // ... or if we already voted for a different candidate ...
+		m.Term == r.Term && (r.Vote != m.From && r.Vote != None || r.Lead != None) || // ... or if we already voted for a different candidate or already think there is a leader ...
 		!candidateIsUpToDate(r.RaftLog, m.LogTerm, m.Index) { // ... or the candidate's log is not up to date
 		reject = true
 	} else {
