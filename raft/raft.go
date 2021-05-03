@@ -209,14 +209,14 @@ func (r *Raft) bcastAppend() {
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
-	next := r.Prs[to].Match + 1
-	ents, err := r.RaftLog.entriesFrom(next)
+	pr := r.Prs[to]
+	ents, err := r.RaftLog.entriesFrom(pr.Next)
 	if err != nil {
 		log.Panicf("failed to get entries to send: %v", err)
 	}
 	// LogTerm and Index sent are those of the entry immediately preceding this batch
-	term := r.RaftLog.mustTerm(next - 1)
-	r.send(pb.Message{To: to, Term: r.Term, LogTerm: term, Index: next - 1, Commit: r.RaftLog.committed, Entries: entriesToPtr(ents), MsgType: pb.MessageType_MsgAppend})
+	term := r.RaftLog.mustTerm(pr.Next - 1)
+	r.send(pb.Message{To: to, Term: r.Term, LogTerm: term, Index: pr.Next - 1, Commit: r.RaftLog.committed, Entries: entriesToPtr(ents), MsgType: pb.MessageType_MsgAppend})
 	return false
 }
 
@@ -231,9 +231,7 @@ func (r *Raft) bcastHeartbeat() {
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
-	li := r.RaftLog.LastIndex()
-	term := r.RaftLog.mustTerm(li)
-	r.send(pb.Message{To: to, Term: r.Term, LogTerm: term, Index: li, Commit: r.RaftLog.committed, MsgType: pb.MessageType_MsgHeartbeat})
+	r.send(pb.Message{To: to, Term: r.Term, Commit: r.RaftLog.committed, MsgType: pb.MessageType_MsgHeartbeat})
 }
 
 // tick advances the internal logical clock by a single tick.
@@ -263,6 +261,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	log.Infof("%x becoming candidate", r.id)
+	r.reset(r.Term)
 	r.State = StateCandidate
 	r.Term++
 }
@@ -270,6 +269,7 @@ func (r *Raft) becomeCandidate() {
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	log.Infof("%x becoming leader", r.id)
+	r.reset(r.Term)
 	r.State = StateLeader
 	r.Lead = r.id
 	// Leader creates a noop entry when starting a new term
@@ -279,7 +279,9 @@ func (r *Raft) becomeLeader() {
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
-	if m.Term > r.Term {
+	if m.Term == 0 {
+		// local message, proceed
+	} else if m.Term > r.Term {
 		if m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgAppend {
 			// Heartbeat or Append received from a leader with a higher term, so we should fall back to a follower.
 			r.becomeFollower(m.Term, m.From)
@@ -292,7 +294,11 @@ func (r *Raft) Step(m pb.Message) error {
 			// Heartbeat received from leader with a lower term. Reply with a message to "disrupt" the leader to
 			// become a follower.
 			r.send(pb.Message{To: m.From, Term: r.Term, MsgType: pb.MessageType_MsgAppendResponse})
+		} else if m.MsgType == pb.MessageType_MsgRequestVote {
+			r.send(pb.Message{To: m.From, Term: r.Term, Reject: true, MsgType: pb.MessageType_MsgRequestVoteResponse})
 		}
+		// Ignore this stale message
+		return nil
 	}
 	var err error
 	switch r.State {
@@ -308,6 +314,8 @@ func (r *Raft) Step(m pb.Message) error {
 
 func (r *Raft) stepFollower(m pb.Message) error {
 	switch m.MsgType {
+	case pb.MessageType_MsgHeartbeat:
+		r.handleHeartbeat(m)
 	case pb.MessageType_MsgAppend:
 		r.Term = m.Term
 		r.handleAppendEntries(m)
@@ -345,12 +353,17 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 }
 
 func (r *Raft) stepLeader(m pb.Message) error {
+	pr := r.Prs[m.From]
 	switch m.MsgType {
 	case pb.MessageType_MsgBeat:
 		r.bcastHeartbeat()
+	case pb.MessageType_MsgHeartbeatResponse:
+		if pr.Match < r.RaftLog.LastIndex() {
+			r.sendAppend(m.From)
+		}
 	case pb.MessageType_MsgAppendResponse:
-		r.Prs[m.From].Match = m.Index
-		r.Prs[m.From].Next = m.Index + 1
+		pr.Match = m.Index
+		pr.Next = m.Index + 1
 		if r.maybeCommit() {
 			r.bcastAppend()
 		}
@@ -508,7 +521,8 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
-	// Your Code Here (2A).
+	r.RaftLog.commit(m.Commit)
+	r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgHeartbeatResponse})
 }
 
 // handleSnapshot handle Snapshot RPC request
