@@ -328,6 +328,7 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		r.broadcast(pb.Message{MsgType: pb.MessageType_MsgHeartbeat})
 	case pb.MessageType_MsgAppendResponse:
 		r.Prs[m.From].Match = m.Index
+		r.Prs[m.From].Next = m.Index + 1
 		if r.maybeCommit() {
 			r.bcastAppend()
 		}
@@ -348,6 +349,7 @@ func (r *Raft) leaderAppendEntries(entries ...*pb.Entry) {
 	}
 	r.RaftLog.append(entriesToValue(entries)...)
 	r.Prs[r.id].Match = entries[len(entries)-1].Index
+	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
 	r.maybeCommit()
 }
 
