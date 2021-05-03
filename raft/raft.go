@@ -322,8 +322,10 @@ func (r *Raft) Step(m pb.Message) error {
 func (r *Raft) stepFollower(m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgHeartbeat:
+		r.Lead = m.From // Could be the first message after leader is elected
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgAppend:
+		r.Lead = m.From // Could be the first message after leader is elected
 		r.Term = m.Term
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgHup:
