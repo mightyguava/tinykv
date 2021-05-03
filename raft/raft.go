@@ -328,8 +328,11 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 			log.Infof("%x rejected vote", m.From)
 		}
 		r.votes[m.From] = !m.Reject
-		if r.tallyVotes() {
+		if r.tallyVotes() == voteAccepted {
 			r.becomeLeader()
+			r.bcastAppend()
+		} else if r.tallyVotes() == voteRejected {
+			r.becomeFollower(m.Term, None)
 		}
 	case pb.MessageType_MsgAppend:
 		if m.Term >= r.Term {
@@ -400,7 +403,7 @@ func (r *Raft) startElection() {
 	log.Infof("%x starting campaign for term %d", r.id, r.Term)
 	logTerm := r.RaftLog.mustTerm(r.RaftLog.LastIndex())
 	r.broadcast(pb.Message{Index: r.RaftLog.LastIndex(), LogTerm: logTerm, MsgType: pb.MessageType_MsgRequestVote})
-	if r.tallyVotes() {
+	if r.tallyVotes() == voteAccepted {
 		r.becomeLeader()
 	}
 }
@@ -435,9 +438,22 @@ func (r *Raft) reset(term uint64) {
 		delete(r.votes, k)
 	}
 	r.Vote = None
+	for pr, prg := range r.Prs {
+		prg.Match = 0
+		prg.Next = r.RaftLog.LastIndex() + 1
+		if pr == r.id {
+			prg.Match = r.RaftLog.LastIndex()
+		}
+	}
 }
 
-func (r *Raft) tallyVotes() bool {
+const (
+	voteWaiting int = iota
+	voteAccepted
+	voteRejected
+)
+
+func (r *Raft) tallyVotes() int {
 	required := len(r.Prs)/2 + 1
 	count := 0
 	for pr := range r.Prs {
@@ -445,7 +461,14 @@ func (r *Raft) tallyVotes() bool {
 			count++
 		}
 	}
-	return count >= required
+	if count >= required {
+		return voteAccepted
+	}
+	// If number of rejections exceeds required votes, reject
+	if (len(r.votes) - count) >= required {
+		return voteRejected
+	}
+	return voteWaiting
 }
 
 func (r *Raft) maybeCommit() bool {
