@@ -126,11 +126,8 @@ func (l *RaftLog) maybeAppend(prevLogIndex, prevLogTerm, leaderCommit uint64, en
 	// If leaderCommit > commitIndex, set commitIndex =
 	// min(leaderCommit, index of last new entry)
 	if l.committed < leaderCommit {
-		if len(entries) > 0 {
-			l.commit(min(leaderCommit, entries[len(entries)-1].Index))
-		} else {
-			l.commit(leaderCommit)
-		}
+		lastNewIndex := prevLogIndex + uint64(len(entries))
+		l.commit(min(leaderCommit, lastNewIndex))
 	}
 	return l.LastIndex(), true
 }

@@ -231,7 +231,14 @@ func (r *Raft) bcastHeartbeat() {
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
-	r.send(pb.Message{To: to, Term: r.Term, Commit: r.RaftLog.committed, MsgType: pb.MessageType_MsgHeartbeat})
+	// Attach the commit as min(to.matched, r.committed).
+	// When the leader sends out heartbeat message,
+	// the receiver(follower) might not be matched with the leader
+	// or it might not have all the committed entries.
+	// The leader MUST NOT forward the follower's commit to
+	// an unmatched index.
+	committed := min(r.RaftLog.committed, r.Prs[to].Match)
+	r.send(pb.Message{To: to, Term: r.Term, Commit: committed, MsgType: pb.MessageType_MsgHeartbeat})
 }
 
 // tick advances the internal logical clock by a single tick.
@@ -513,6 +520,7 @@ func (r *Raft) maybeCommit() bool {
 
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
+	r.electionElapsed = 0
 	last, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, entriesToValue(m.Entries)...)
 	if !ok {
 		r.send(pb.Message{To: m.From, Reject: true, MsgType: pb.MessageType_MsgAppendResponse})
@@ -523,6 +531,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
+	r.electionElapsed = 0
 	r.RaftLog.commit(m.Commit)
 	r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgHeartbeatResponse})
 }
