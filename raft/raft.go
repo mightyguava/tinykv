@@ -208,10 +208,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 		log.Panicf("failed to get entries to send: %v", err)
 	}
 	// LogTerm and Index sent are those of the entry immediately preceding this batch
-	term, err := r.RaftLog.Term(next - 1)
-	if err != nil {
-		log.Panicf("failed to get log term: %v", err)
-	}
+	term := r.RaftLog.mustTerm(next - 1)
 	r.send(pb.Message{To: to, Term: r.Term, LogTerm: term, Index: next - 1, Commit: r.RaftLog.committed, Entries: entriesToPtr(ents), MsgType: pb.MessageType_MsgAppend})
 	return false
 }
@@ -380,7 +377,8 @@ func (r *Raft) startElection() {
 	r.votes[r.id] = true
 	r.Vote = r.id
 	log.Infof("%x starting campaign for term %d", r.id, r.Term)
-	r.broadcast(pb.Message{MsgType: pb.MessageType_MsgRequestVote})
+	logTerm := r.RaftLog.mustTerm(r.RaftLog.LastIndex())
+	r.broadcast(pb.Message{Index: r.RaftLog.LastIndex(), LogTerm: logTerm, MsgType: pb.MessageType_MsgRequestVote})
 	if r.tallyVotes() {
 		r.becomeLeader()
 	}
@@ -389,13 +387,22 @@ func (r *Raft) startElection() {
 func (r *Raft) vote(m pb.Message) {
 	reject := false
 	if m.Term < r.Term || // Reject if the message has a lower term ...
-		m.Term == r.Term && r.Vote != m.From && r.Vote != None { // ... or if we already voted for a different candidate ...
+		m.Term == r.Term && r.Vote != m.From && r.Vote != None || // ... or if we already voted for a different candidate ...
+		!candidateIsUpToDate(r.RaftLog, m.LogTerm, m.Index) { // ... or the candidate's log is not up to date
 		reject = true
 	} else {
 		r.Term = m.Term
 		r.Vote = m.From
 	}
 	r.send(pb.Message{To: m.From, Reject: reject, MsgType: pb.MessageType_MsgRequestVoteResponse})
+}
+
+func candidateIsUpToDate(l *RaftLog, term, index uint64) bool {
+	lastTerm, err := l.Term(l.LastIndex())
+	if err != nil {
+		log.Panicf("error getting last term: %v", err)
+	}
+	return term > lastTerm || (term == lastTerm && index >= l.LastIndex())
 }
 
 func (r *Raft) reset(term uint64) {
@@ -432,6 +439,12 @@ func (r *Raft) maybeCommit() bool {
 		return index[i] < index[j]
 	})
 	minReplicated = index[len(index)-quorum]
+	term := r.RaftLog.mustTerm(minReplicated)
+	if term < r.Term {
+		// Leader does not try to commit entries from previous terms. Once an entry from the current term is committed,
+		// entries from previous terms are indirectly committed. §5.4.2
+		return false
+	}
 	if minReplicated > r.RaftLog.committed {
 		r.RaftLog.commit(minReplicated)
 		return true

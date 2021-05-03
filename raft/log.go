@@ -229,3 +229,11 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	}
 	return ent[0].Term, nil
 }
+
+func (l *RaftLog) mustTerm(i uint64) uint64 {
+	term, err := l.Term(i)
+	if err != nil {
+		log.Panicf("error getting term for index %d: %v", i, err)
+	}
+	return term
+}
