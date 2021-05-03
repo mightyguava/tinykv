@@ -437,9 +437,12 @@ func (r *Raft) maybeCommit() {
 
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
-	// Your Code Here (2A).
-	r.RaftLog.append(entriesToValue(m.Entries)...)
-	r.send(pb.Message{To: r.Lead, Index: r.RaftLog.LastIndex(), MsgType: pb.MessageType_MsgAppendResponse})
+	last, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, entriesToValue(m.Entries)...)
+	if !ok {
+		r.send(pb.Message{To: m.From, Reject: true, MsgType: pb.MessageType_MsgAppendResponse})
+	} else {
+		r.send(pb.Message{To: m.From, Index: last, MsgType: pb.MessageType_MsgAppendResponse})
+	}
 }
 
 // handleHeartbeat handle Heartbeat RPC request

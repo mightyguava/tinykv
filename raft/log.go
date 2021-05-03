@@ -83,6 +83,19 @@ func (l *RaftLog) append(entries ...pb.Entry) {
 	l.entries = append(l.entries, entries...)
 }
 
+func (l *RaftLog) maybeAppend(prevLogIndex, prevLogTerm, leaderCommit uint64, entries ...pb.Entry) (lastIndex uint64, accepted bool) {
+	// Reject if log doesn’t contain an entry at prevLogIndex
+	// whose term matches prevLogTerm (§5.3)
+	if term, err := l.Term(prevLogIndex); err != nil || term != prevLogTerm {
+		return 0, false
+	}
+	l.entries = append(l.entries, entries...)
+	if l.committed < leaderCommit {
+		l.commit(leaderCommit)
+	}
+	return l.LastIndex(), true
+}
+
 // We need to compact the log entries in some point of time like
 // storage compact stabled log entries prevent the log entries
 // grow unlimitedly in memory
@@ -105,6 +118,14 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 		log.Panicf("error fetching next entries: %v", err)
 	}
 	return ents
+}
+
+func (l *RaftLog) getEntry(idx uint64) (pb.Entry, error) {
+	ents, err := l.slice(idx, idx+1)
+	if len(ents) == 0 {
+		return pb.Entry{}, errors.New("entry not found")
+	}
+	return ents[0], err
 }
 
 func (l *RaftLog) entriesFrom(lo uint64) ([]pb.Entry, error) {
