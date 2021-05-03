@@ -366,6 +366,8 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		pr.Next = m.Index + 1
 		if r.maybeCommit() {
 			r.bcastAppend()
+		} else if pr.Next < r.RaftLog.LastIndex() {
+			r.sendAppend(m.From)
 		}
 	case pb.MessageType_MsgRequestVote:
 		r.vote(m)
