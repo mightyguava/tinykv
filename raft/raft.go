@@ -331,7 +331,9 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		r.broadcast(pb.Message{MsgType: pb.MessageType_MsgHeartbeat})
 	case pb.MessageType_MsgAppendResponse:
 		r.Prs[m.From].Match = m.Index
-		r.maybeCommit()
+		if r.maybeCommit() {
+			r.bcastAppend()
+		}
 	case pb.MessageType_MsgRequestVote:
 		r.vote(m)
 	case pb.MessageType_MsgPropose:
@@ -418,7 +420,7 @@ func (r *Raft) tallyVotes() bool {
 	return count >= required
 }
 
-func (r *Raft) maybeCommit() {
+func (r *Raft) maybeCommit() bool {
 	// Find the smallest index that has been replicated to a quorum of nodes.
 	minReplicated := uint64(0)
 	quorum := len(r.Prs)/2 + 1
@@ -432,7 +434,9 @@ func (r *Raft) maybeCommit() {
 	minReplicated = index[len(index)-quorum]
 	if minReplicated > r.RaftLog.committed {
 		r.RaftLog.commit(minReplicated)
+		return true
 	}
+	return false
 }
 
 // handleAppendEntries handle AppendEntries RPC request
@@ -467,8 +471,8 @@ func (r *Raft) removeNode(id uint64) {
 
 func entriesToPtr(r []pb.Entry) []*pb.Entry {
 	ptr := make([]*pb.Entry, len(r))
-	for i, e := range r {
-		ptr[i] = &e
+	for i := range r {
+		ptr[i] = &r[i]
 	}
 	return ptr
 }
