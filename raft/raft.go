@@ -172,13 +172,22 @@ func newRaft(c *Config) *Raft {
 	if err := c.validate(); err != nil {
 		panic(err.Error())
 	}
-	prs := make(map[uint64]*Progress)
-	for _, p := range c.peers {
-		prs[p] = &Progress{}
-	}
-	hardState, _, err := c.Storage.InitialState()
+	hardState, confState, err := c.Storage.InitialState()
 	if err != nil {
 		panic(err)
+	}
+	var peers []uint64
+	if len(confState.Nodes) > 0 {
+		peers = confState.Nodes
+		if len(c.peers) > 0 {
+			panic("config.peers cannot be set when restarting raft with existing state")
+		}
+	} else {
+		peers = c.peers
+	}
+	prs := make(map[uint64]*Progress)
+	for _, p := range peers {
+		prs[p] = &Progress{}
 	}
 	r := &Raft{
 		id:               c.ID,
@@ -507,7 +516,10 @@ func (r *Raft) maybeCommit() bool {
 		return index[i] < index[j]
 	})
 	minReplicated = index[len(index)-quorum]
-	term := r.RaftLog.mustTerm(minReplicated)
+	term, err := r.RaftLog.Term(minReplicated)
+	if err != nil {
+		return false
+	}
 	if term < r.Term {
 		// Leader does not try to commit entries from previous terms. Once an entry from the current term is committed,
 		// entries from previous terms are indirectly committed. §5.4.2

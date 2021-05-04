@@ -206,6 +206,10 @@ func TestPeerStorageAppend(t *testing.T) {
 		results []eraftpb.Entry
 	}{
 		{
+			[]eraftpb.Entry{newTestEntry(4, 6)},
+			[]eraftpb.Entry{newTestEntry(4, 6)},
+		},
+		{
 			[]eraftpb.Entry{newTestEntry(3, 3), newTestEntry(4, 4), newTestEntry(5, 5)},
 			[]eraftpb.Entry{newTestEntry(4, 4), newTestEntry(5, 5)},
 		},
