@@ -67,19 +67,59 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 }
 
-func (d *peerMsgHandler) apply(ents []eraftpb.Entry) {
-	for i, ent := range ents {
-		proposal := d.proposals[i]
-		if proposal.index != ent.Index {
-			log.Panicf("unexpected proposal index %d for entry %d", proposal.index, ent.Index)
+func (d *peerMsgHandler) findProposal(term, index uint64) *proposal {
+	for ; len(d.proposals) > 0; {
+		p := d.proposals[0]
+		// Break if the proposal found is for a future index
+		if p.term > term || p.term == term && p.index > index {
+			return nil
 		}
-		cb := proposal.cb
+		d.proposals = d.proposals[1:]
+		if p.term == term {
+			if p.index == index {
+				return p
+			} else {
+				// p.index < index
+				log.Panicf("%s unexpected proposal at term %d, found index %d, expected %d", d.Tag, p.term, p.index, index)
+			}
+		} else {
+			log.Warnf("%s skipping stale proposal at term %d index %d", d.Tag, p.term, p.index)
+		}
+	}
+	return nil
+}
+
+func (d *peerMsgHandler) apply(ents []eraftpb.Entry) {
+	for _, ent := range ents {
+		if len(ent.Data) == 0 {
+			// noop entry, skip
+			continue
+		}
+		proposal := d.findProposal(ent.Term, ent.Index)
+		var cb *message.Callback
+		if proposal != nil {
+			// Proposal can be nil if this node was a follower when the proposal was made.
+			cb = proposal.cb
+		}
 		cmdReq := &raft_cmdpb.RaftCmdRequest{}
 		if err := cmdReq.Unmarshal(ent.Data); err != nil {
 			cb.Done(ErrResp(err))
 			continue
 		}
-		resp := &raft_cmdpb.RaftCmdResponse{}
+		resp := newCmdResp()
+
+		// Snap requests are special, requiring a badger.Txn to be passed back directly.
+		if len(cmdReq.Requests) == 1 && cmdReq.Requests[0].CmdType == raft_cmdpb.CmdType_Snap {
+			if cb != nil {
+				cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Snap,
+					Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+				})
+				cb.Done(resp)
+			}
+			continue
+		}
 		for _, req := range cmdReq.Requests {
 			rr, err := d.handleRequest(req)
 			if err != nil {
@@ -90,7 +130,6 @@ func (d *peerMsgHandler) apply(ents []eraftpb.Entry) {
 		}
 		cb.Done(resp)
 	}
-	d.proposals = d.proposals[len(ents):]
 	raftWB := new(engine_util.WriteBatch)
 	applyState := &rspb.RaftApplyState{
 		AppliedIndex: ents[len(ents)-1].Index,
@@ -202,14 +241,15 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrResp(err))
 		return
 	}
+	d.proposals = append(d.proposals, &proposal{
+		index: d.nextProposalIndex(),
+		term:  d.Term(),
+		cb:    cb,
+	})
 	if err := d.RaftGroup.Propose(data); err != nil {
 		cb.Done(ErrResp(err))
 		return
 	}
-	d.proposals = append(d.proposals, &proposal{
-		index: d.nextProposalIndex(),
-		cb:    cb,
-	})
 }
 
 func (d *peerMsgHandler) onTick() {

@@ -381,7 +381,7 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		}
 	case pb.MessageType_MsgAppendResponse:
 		pr.Match = m.Index
-		pr.Next = m.Index + 1
+		pr.Next = max(r.RaftLog.firstIndex, m.Index+1)
 		if r.maybeCommit() {
 			r.bcastAppend()
 		} else if pr.Next < r.RaftLog.LastIndex() {
