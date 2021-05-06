@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/pingcap-incubator/tinykv/kv/config"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
@@ -14,6 +15,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
 	"github.com/pingcap-incubator/tinykv/raft"
 	"github.com/pingcap/errors"
@@ -178,6 +180,108 @@ func (p *peer) getPeerFromCache(peerID uint64) *metapb.Peer {
 		}
 	}
 	return nil
+}
+
+func (p *peer) findProposal(term, index uint64) *proposal {
+	for ; len(p.proposals) > 0; {
+		prop := p.proposals[0]
+		// Break if the proposal found is for a future index
+		if prop.term > term || prop.term == term && prop.index > index {
+			return nil
+		}
+		p.proposals = p.proposals[1:]
+		if prop.term == term {
+			if prop.index == index {
+				return prop
+			} else {
+				// prop.index < index
+				log.Panicf("%s unexpected proposal at term %d, found index %d, expected %d", p.Tag, prop.term, prop.index, index)
+			}
+		} else {
+			log.Warnf("%s skipping stale proposal at term %d index %d", p.Tag, prop.term, prop.index)
+			prop.cb.Done(ErrRespStaleCommand(term))
+		}
+	}
+	return nil
+}
+
+func (p *peer) apply(ents []eraftpb.Entry) {
+	for _, ent := range ents {
+		if len(ent.Data) == 0 {
+			// noop entry, skip
+			continue
+		}
+		proposal := p.findProposal(ent.Term, ent.Index)
+		var cb *message.Callback
+		if proposal != nil {
+			// Proposal can be nil if this node was a follower when the proposal was made.
+			cb = proposal.cb
+		}
+		cmdReq := &raft_cmdpb.RaftCmdRequest{}
+		if err := proto.Unmarshal(ent.Data, cmdReq); err != nil {
+			cb.Done(ErrResp(err))
+			continue
+		}
+		resp := newCmdResp()
+
+		// Snap requests are special, requiring a badger.Txn to be passed back directly.
+		if len(cmdReq.Requests) == 1 && cmdReq.Requests[0].CmdType == raft_cmdpb.CmdType_Snap {
+			if cb != nil {
+				cb.Txn = p.peerStorage.Engines.Kv.NewTransaction(false)
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Snap,
+					Snap:    &raft_cmdpb.SnapResponse{Region: p.Region()},
+				})
+				cb.Done(resp)
+			}
+			continue
+		}
+		for _, req := range cmdReq.Requests {
+			rr, err := p.handleRequest(req)
+			if err != nil {
+				cb.Done(ErrResp(err))
+				break
+			}
+			resp.Responses = append(resp.Responses, rr)
+		}
+		cb.Done(resp)
+	}
+	raftWB := new(engine_util.WriteBatch)
+	applyState := &rspb.RaftApplyState{
+		AppliedIndex: ents[len(ents)-1].Index,
+	}
+	if err := raftWB.SetMeta(meta.ApplyStateKey(p.regionId), applyState); err != nil {
+		log.Panicf("failed to set apply state")
+	}
+	if err := p.peerStorage.Engines.WriteRaft(raftWB); err != nil {
+		log.Panicf("failed to save apply state")
+	}
+}
+
+func (p *peer) handleRequest(req *raft_cmdpb.Request) (*raft_cmdpb.Response, error) {
+	resp := &raft_cmdpb.Response{CmdType: req.CmdType}
+	kv := p.peerStorage.Engines.Kv
+	switch req.CmdType {
+	case raft_cmdpb.CmdType_Get:
+		v, err := engine_util.GetCF(kv, req.Get.Cf, req.Get.Key)
+		if err != nil {
+			return nil, err
+		}
+		resp.Get = &raft_cmdpb.GetResponse{Value: v}
+	case raft_cmdpb.CmdType_Put:
+		op := req.Put
+		if err := engine_util.PutCF(kv, op.Cf, op.Key, op.Value); err != nil {
+			return nil, err
+		}
+		resp.Put = &raft_cmdpb.PutResponse{}
+	case raft_cmdpb.CmdType_Delete:
+		op := req.Delete
+		if err := engine_util.DeleteCF(kv, op.Cf, op.Key); err != nil {
+			return nil, err
+		}
+		resp.Delete = &raft_cmdpb.DeleteResponse{}
+	}
+	return resp, nil
 }
 
 func (p *peer) nextProposalIndex() uint64 {
