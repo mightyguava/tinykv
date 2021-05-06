@@ -351,7 +351,7 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 		r.startElection()
 	case pb.MessageType_MsgRequestVoteResponse:
 		if m.Reject {
-			log.Infof("%x rejected vote", m.From)
+			log.Infof("%x rejected vote for %x", m.From, r.id)
 		}
 		r.votes[m.From] = !m.Reject
 		if r.tallyVotes() == voteAccepted {
@@ -508,7 +508,7 @@ func (r *Raft) maybeCommit() bool {
 	// Find the smallest index that has been replicated to a quorum of nodes.
 	minReplicated := uint64(0)
 	quorum := len(r.Prs)/2 + 1
-	index := make([]uint64, 0, len(r.Prs)-1)
+	index := make([]uint64, 0, len(r.Prs))
 	for _, prg := range r.Prs {
 		index = append(index, prg.Match)
 	}

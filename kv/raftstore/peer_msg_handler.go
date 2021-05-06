@@ -64,8 +64,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				log.Errorf("%s error send to peer %d: %v", d.Tag, msg.To, err)
 			}
 		}
-		if len(rd.Entries) > 0 {
-			d.apply(rd.Entries)
+		if len(rd.CommittedEntries) > 0 {
+			d.apply(rd.CommittedEntries)
 		}
 		d.RaftGroup.Advance(rd)
 	}
