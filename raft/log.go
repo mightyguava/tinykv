@@ -119,8 +119,7 @@ func (l *RaftLog) maybeAppend(prevLogIndex, prevLogTerm, leaderCommit uint64, en
 			log.Panicf("error getting entries: %v", err)
 		}
 		// append the new entries
-		toAdd := entries[conflictingIndex-entries[0].Index:]
-		l.entries = append(l.entries, toAdd...)
+		l.append(entries[conflictingIndex-entries[0].Index:]...)
 	}
 
 	// If leaderCommit > commitIndex, set commitIndex =
@@ -164,7 +163,8 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	ents, err := l.slice(max(l.applied+1, l.firstIndex), l.committed+1)
 	if err != nil {
-		log.Panicf("error fetching next entries: %v", err)
+		log.Panicf("error fetching next entries, firstIndex %d applied %d committed %d: %v",
+			l.firstIndex, l.applied, l.committed, err)
 	}
 	return ents
 }
@@ -197,7 +197,10 @@ func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
 }
 
 func (l *RaftLog) commit(index uint64) {
-	l.committed = index
+	// committed cannot decrease
+	if l.committed < index {
+		l.committed = index
+	}
 }
 
 // LastIndex return the last index of the log entries

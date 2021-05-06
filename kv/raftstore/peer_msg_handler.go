@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Connor1996/badger/y"
+	"github.com/golang/protobuf/proto"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
@@ -51,12 +52,14 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			log.Fatal("%s save ready state error %v", d.Tag, err)
 		}
 		for _, msg := range rd.Messages {
+			// prevent accidental pointer reuse...
+			mm := msg
 			if err := d.ctx.trans.Send(&rspb.RaftMessage{
 				RegionId:    d.regionId,
 				FromPeer:    d.Meta,
 				ToPeer:      d.getPeerFromCache(msg.To),
 				RegionEpoch: d.Region().RegionEpoch,
-				Message:     &msg,
+				Message:     &mm,
 			}); err != nil {
 				log.Errorf("%s error send to peer %d: %v", d.Tag, msg.To, err)
 			}
@@ -64,6 +67,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		if len(rd.Entries) > 0 {
 			d.apply(rd.Entries)
 		}
+		d.RaftGroup.Advance(rd)
 	}
 }
 
@@ -102,7 +106,7 @@ func (d *peerMsgHandler) apply(ents []eraftpb.Entry) {
 			cb = proposal.cb
 		}
 		cmdReq := &raft_cmdpb.RaftCmdRequest{}
-		if err := cmdReq.Unmarshal(ent.Data); err != nil {
+		if err := proto.Unmarshal(ent.Data, cmdReq); err != nil {
 			cb.Done(ErrResp(err))
 			continue
 		}
@@ -236,7 +240,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrResp(err))
 		return
 	}
-	data, err := msg.Marshal()
+	data, err := proto.Marshal(msg)
 	if err != nil {
 		cb.Done(ErrResp(err))
 		return
@@ -455,7 +459,7 @@ func (d *peerMsgHandler) checkSnapshot(msg *rspb.RaftMessage) (*snap.SnapKey, er
 	snapshot := msg.Message.Snapshot
 	key := snap.SnapKeyFromRegionSnap(regionID, snapshot)
 	snapData := new(rspb.RaftSnapshotData)
-	err := snapData.Unmarshal(snapshot.Data)
+	err := proto.Unmarshal(snapshot.Data, snapData)
 	if err != nil {
 		return nil, err
 	}
