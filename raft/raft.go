@@ -217,16 +217,30 @@ func (r *Raft) bcastAppend() {
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
-func (r *Raft) sendAppend(to uint64) bool {
+func (r *Raft) sendAppend(to uint64) {
 	pr := r.Prs[to]
+	if pr.Next < r.RaftLog.firstIndex {
+		// When the leader has already discarded the next log entry that it needs to send to a follower,
+		// it sends a snapshot instead. §7
+		snap, err := r.RaftLog.snapshot()
+		if err != nil {
+			if err == ErrSnapshotTemporarilyUnavailable {
+				log.Debugf("%x failed to send snapshot to %x because it's temporarily unavailable", r.id, to)
+				return
+			}
+			log.Panicf("%x failed to get snapshot: %v", r.id, err)
+		}
+		r.send(pb.Message{To: to, MsgType: pb.MessageType_MsgSnapshot, Snapshot: &snap})
+		return
+	}
 	ents, err := r.RaftLog.entriesFrom(pr.Next)
 	if err != nil {
 		log.Panicf("failed to get entries to send: %v", err)
 	}
 	// LogTerm and Index sent are those of the entry immediately preceding this batch
 	term := r.RaftLog.mustTerm(pr.Next - 1)
-	r.send(pb.Message{To: to, Term: r.Term, LogTerm: term, Index: pr.Next - 1, Commit: r.RaftLog.committed, Entries: entriesToPtr(ents), MsgType: pb.MessageType_MsgAppend})
-	return false
+	r.send(pb.Message{To: to, LogTerm: term, Index: pr.Next - 1, Commit: r.RaftLog.committed, Entries: entriesToPtr(ents), MsgType: pb.MessageType_MsgAppend})
+	return
 }
 
 func (r *Raft) bcastHeartbeat() {
@@ -341,6 +355,9 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		r.startElection()
 	case pb.MessageType_MsgRequestVote:
 		r.vote(m)
+	case pb.MessageType_MsgSnapshot:
+		r.Lead = m.From
+		r.handleSnapshot(m)
 	}
 	return nil
 }
@@ -366,6 +383,9 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 		}
 	case pb.MessageType_MsgRequestVote:
 		r.vote(m)
+	case pb.MessageType_MsgSnapshot:
+		r.becomeFollower(m.Term, m.From)
+		r.handleSnapshot(m)
 	}
 	return nil
 }
@@ -567,7 +587,42 @@ func (r *Raft) hardState() pb.HardState {
 
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
-	// Your Code Here (2C).
+	// reset peers from snapshot data
+	r.Prs = make(map[uint64]*Progress, len(m.Snapshot.Metadata.ConfState.Nodes))
+	for _, pr := range m.Snapshot.Metadata.ConfState.Nodes {
+		r.Prs[pr] = &Progress{
+			Match: 0,
+			Next:  m.Snapshot.Metadata.Index,
+		}
+	}
+	sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
+	if r.restore(m.Snapshot) {
+		log.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
+			r.id, r.RaftLog.committed, sindex, sterm)
+		r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex()})
+	} else {
+		log.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
+			r.id, r.RaftLog.committed, sindex, sterm)
+		r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.committed})
+	}
+}
+
+// restore recovers the state machine from a snapshot. It restores the log and the
+// configuration of state machine. If this method returns false, the snapshot was
+// ignored, either because it was obsolete or because of an error.
+func (r *Raft) restore(s *pb.Snapshot) bool {
+	sindex, sterm := s.Metadata.Index, s.Metadata.Term
+	if r.RaftLog.committed > sindex {
+		// obsolete snapshot
+		return false
+	}
+	if term, err := r.RaftLog.Term(sindex); err == nil && term == sterm {
+		// Already in log, fast forward the commit index
+		r.RaftLog.commit(sindex)
+		return false
+	}
+	r.RaftLog.restore(s)
+	return true
 }
 
 // addNode add a new node to raft group

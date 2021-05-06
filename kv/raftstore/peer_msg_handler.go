@@ -10,7 +10,9 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
@@ -45,8 +47,12 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 	if d.RaftGroup.HasReady() {
 		rd := d.RaftGroup.Ready()
-		if _, err := d.peerStorage.SaveReadyState(&rd); err != nil {
+		applySnapResult, err := d.peerStorage.SaveReadyState(&rd)
+		if err != nil {
 			log.Fatal("%s save ready state error %v", d.Tag, err)
+		}
+		if applySnapResult != nil {
+			d.SetRegion(applySnapResult.Region)
 		}
 		for _, msg := range rd.Messages {
 			// prevent accidental pointer reuse...
@@ -65,6 +71,50 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			d.apply(rd.CommittedEntries)
 		}
 		d.RaftGroup.Advance(rd)
+	}
+}
+
+func (p *peerMsgHandler) apply(ents []eraftpb.Entry) {
+	for _, ent := range ents {
+		if len(ent.Data) == 0 {
+			// noop entry, skip
+			continue
+		}
+
+		proposal := p.findProposal(ent.Term, ent.Index)
+		var cb *message.Callback
+		if proposal != nil {
+			// Proposal can be nil if this node was a follower when the proposal was made, or the node restarted.
+			cb = proposal.cb
+		}
+		cmdReq := &raft_cmdpb.RaftCmdRequest{}
+		if err := proto.Unmarshal(ent.Data, cmdReq); err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+
+		switch {
+		case cmdReq.AdminRequest != nil:
+			p.applyAdminCmd(ent.Index, cmdReq.AdminRequest)
+		default:
+			p.applyCommand(ent.Index, cmdReq, cb)
+		}
+	}
+}
+
+func (d *peerMsgHandler) applyAdminCmd(index uint64, req *raft_cmdpb.AdminRequest) {
+	switch req.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		// Compaction truncates the log. The truncated index is updated immediately,
+		// while the actual truncation is done in the background.
+		compact := req.CompactLog
+		truncateState := d.peerStorage.applyState.TruncatedState
+		truncateState.Index = compact.CompactIndex
+		truncateState.Term = compact.CompactTerm
+		d.ScheduleCompactLog(truncateState.Index)
+		d.peerStorage.SaveApplyResults(index, &engine_util.WriteBatch{})
+	default:
+		// not yet implemented
 	}
 }
 

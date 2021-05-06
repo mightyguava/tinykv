@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/pingcap-incubator/tinykv/kv/config"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
@@ -205,29 +204,8 @@ func (p *peer) findProposal(term, index uint64) *proposal {
 	return nil
 }
 
-func (p *peer) apply(ents []eraftpb.Entry) {
-	for _, ent := range ents {
-		if len(ent.Data) == 0 {
-			// noop entry, skip
-			continue
-		}
-		p.applyEntry(ent)
-	}
-}
-
 // apply a single entry. All writes go through a single WriteBatch to ensure the apply is atomic.
-func (p *peer) applyEntry(ent eraftpb.Entry) {
-	proposal := p.findProposal(ent.Term, ent.Index)
-	var cb *message.Callback
-	if proposal != nil {
-		// Proposal can be nil if this node was a follower when the proposal was made, or the node restarted.
-		cb = proposal.cb
-	}
-	cmdReq := &raft_cmdpb.RaftCmdRequest{}
-	if err := proto.Unmarshal(ent.Data, cmdReq); err != nil {
-		cb.Done(ErrResp(err))
-		return
-	}
+func (p *peer) applyCommand(index uint64, cmdReq *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	resp := newCmdResp()
 
 	if len(cmdReq.Requests) == 0 {
@@ -280,7 +258,7 @@ func (p *peer) applyEntry(ent eraftpb.Entry) {
 		}
 	}
 
-	p.peerStorage.SaveApplyResults(ent.Index, kvWB)
+	p.peerStorage.SaveApplyResults(index, kvWB)
 
 	cb.Done(resp)
 }

@@ -169,6 +169,9 @@ func (rn *RawNode) Ready() Ready {
 		rd.HardState = hardState
 		rn.prevHardState = hardState
 	}
+	if rn.Raft.RaftLog.hasPendingSnapshot() {
+		rd.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
+	}
 	return rd
 }
 
@@ -178,6 +181,9 @@ func (rn *RawNode) HasReady() bool {
 		return true
 	}
 	if hardState := rn.Raft.hardState(); !proto.Equal(&hardState, &rn.prevHardState) {
+		return true
+	}
+	if rn.Raft.RaftLog.hasPendingSnapshot() {
 		return true
 	}
 	if len(rn.Raft.RaftLog.unstableEntries()) > 0 ||
@@ -198,6 +204,8 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.CommittedEntries) > 0 {
 		rl.applied = lastIndexOf(rd.CommittedEntries)
 	}
+	rl.pendingSnapshot = nil
+	rl.maybeCompact()
 }
 
 func lastIndexOf(ents []pb.Entry) uint64 {

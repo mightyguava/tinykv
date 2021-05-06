@@ -459,6 +459,7 @@ func TestOneSnapshot2C(t *testing.T) {
 	MustGetCfEqual(cluster.engines[1], cf, []byte("k1"), []byte("v1"))
 	MustGetCfEqual(cluster.engines[1], cf, []byte("k2"), []byte("v2"))
 
+	// Ensure compaction hasn't happened yet.
 	for _, engine := range cluster.engines {
 		state, err := meta.GetApplyState(engine.Kv, 1)
 		if err != nil {
@@ -470,6 +471,7 @@ func TestOneSnapshot2C(t *testing.T) {
 		}
 	}
 
+	// Create a partition. Either 2 or 3 will be the leader.
 	cluster.AddFilter(
 		&PartitionFilter{
 			s1: []uint64{1},
@@ -477,16 +479,19 @@ func TestOneSnapshot2C(t *testing.T) {
 		},
 	)
 
-	// write some data to trigger snapshot
+	// write some data to trigger compaction
 	for i := 100; i < 115; i++ {
 		cluster.MustPutCF(cf, []byte(fmt.Sprintf("k%d", i)), []byte(fmt.Sprintf("v%d", i)))
 	}
 	cluster.MustDeleteCF(cf, []byte("k2"))
 	time.Sleep(500 * time.Millisecond)
+	// Node 1 should not have this new data
 	MustGetCfNone(cluster.engines[1], cf, []byte("k100"))
+
+	// Allow 1 to rejoin the cluster
 	cluster.ClearFilters()
 
-	// Now snapshot must applied on
+	// Now snapshot must eventually be applied on node 1
 	MustGetCfEqual(cluster.engines[1], cf, []byte("k1"), []byte("v1"))
 	MustGetCfEqual(cluster.engines[1], cf, []byte("k100"), []byte("v100"))
 	MustGetCfNone(cluster.engines[1], cf, []byte("k2"))

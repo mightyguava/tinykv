@@ -144,16 +144,44 @@ func (l *RaftLog) findFirstConflict(entries ...pb.Entry) uint64 {
 	return 0
 }
 
+func (l *RaftLog) snapshot() (pb.Snapshot, error) {
+	snapshot, err := l.storage.Snapshot()
+	return snapshot, err
+}
+
+func (l *RaftLog) restore(snap *pb.Snapshot) {
+	sindex := snap.Metadata.Index
+	l.committed = sindex
+	l.firstIndex = sindex + 1
+	l.stabled = sindex
+	l.entries = nil
+	l.pendingSnapshot = snap
+}
+
+func (l *RaftLog) hasPendingSnapshot() bool {
+	return l.pendingSnapshot != nil && !IsEmptySnap(l.pendingSnapshot)
+}
+
 // We need to compact the log entries in some point of time like
 // storage compact stabled log entries prevent the log entries
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
-	// Your Code Here (2C).
+	if len(l.entries) == 0 {
+		return
+	}
+	idx, err := l.storage.FirstIndex()
+	if err != nil {
+		log.Panicf("error fetching firstIndex from storage: %v", err)
+	}
+	offset := idx - l.entries[0].Index
+	l.entries = l.entries[offset:]
+	l.firstIndex = idx
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-	numUnstable := l.LastIndex() - l.stabled
+	li := l.LastIndex()
+	numUnstable := li - l.stabled
 	total := len(l.entries)
 	ents := l.entries[total-int(numUnstable) : total]
 	return ents
@@ -207,6 +235,9 @@ func (l *RaftLog) commit(index uint64) {
 func (l *RaftLog) LastIndex() uint64 {
 	if len(l.entries) > 0 {
 		return l.entries[len(l.entries)-1].Index
+	}
+	if l.hasPendingSnapshot() {
+		return l.pendingSnapshot.Metadata.Index
 	}
 	idx, err := l.storage.LastIndex()
 	if err != nil {
