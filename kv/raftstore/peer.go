@@ -211,54 +211,81 @@ func (p *peer) apply(ents []eraftpb.Entry) {
 			// noop entry, skip
 			continue
 		}
-		proposal := p.findProposal(ent.Term, ent.Index)
-		var cb *message.Callback
-		if proposal != nil {
-			// Proposal can be nil if this node was a follower when the proposal was made.
-			cb = proposal.cb
-		}
-		cmdReq := &raft_cmdpb.RaftCmdRequest{}
-		if err := proto.Unmarshal(ent.Data, cmdReq); err != nil {
-			cb.Done(ErrResp(err))
-			continue
-		}
-		resp := newCmdResp()
+		p.applyEntry(ent)
+	}
+}
 
-		// Snap requests are special, requiring a badger.Txn to be passed back directly.
-		if len(cmdReq.Requests) == 1 && cmdReq.Requests[0].CmdType == raft_cmdpb.CmdType_Snap {
-			if cb != nil {
-				cb.Txn = p.peerStorage.Engines.Kv.NewTransaction(false)
-				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
-					CmdType: raft_cmdpb.CmdType_Snap,
-					Snap:    &raft_cmdpb.SnapResponse{Region: p.Region()},
-				})
-				cb.Done(resp)
-			}
-			continue
+// apply a single entry. All writes go through a single WriteBatch to ensure the apply is atomic.
+func (p *peer) applyEntry(ent eraftpb.Entry) {
+	proposal := p.findProposal(ent.Term, ent.Index)
+	var cb *message.Callback
+	if proposal != nil {
+		// Proposal can be nil if this node was a follower when the proposal was made, or the node restarted.
+		cb = proposal.cb
+	}
+	cmdReq := &raft_cmdpb.RaftCmdRequest{}
+	if err := proto.Unmarshal(ent.Data, cmdReq); err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+	resp := newCmdResp()
+
+	if len(cmdReq.Requests) == 0 {
+		cb.Done(resp)
+		return
+	}
+
+	kvWB := new(engine_util.WriteBatch)
+	switch cmdReq.Requests[0].CmdType {
+	case raft_cmdpb.CmdType_Snap:
+		if len(cmdReq.Requests) > 1 {
+			cb.Done(ErrResp(errors.New("expected snap request by itself")))
+			log.Panic("expected snap request by itself")
+			return
 		}
+		if cb != nil {
+			cb.Txn = p.peerStorage.Engines.Kv.NewTransaction(false)
+			resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Snap,
+				Snap:    &raft_cmdpb.SnapResponse{Region: p.Region()},
+			})
+		}
+	case raft_cmdpb.CmdType_Get:
 		for _, req := range cmdReq.Requests {
-			rr, err := p.handleRequest(req)
+			if req.CmdType != raft_cmdpb.CmdType_Get {
+				cb.Done(ErrResp(errors.New("only Get commands expected in read batch")))
+				log.Panic("only Get commands expected in read batch")
+				break
+			}
+			rr, err := p.handleRequest(req, nil)
 			if err != nil {
 				cb.Done(ErrResp(err))
 				break
 			}
 			resp.Responses = append(resp.Responses, rr)
 		}
-		cb.Done(resp)
+	case raft_cmdpb.CmdType_Put, raft_cmdpb.CmdType_Delete:
+		for _, req := range cmdReq.Requests {
+			if req.CmdType != raft_cmdpb.CmdType_Put && req.CmdType != raft_cmdpb.CmdType_Delete {
+				cb.Done(ErrResp(errors.New("only Put/Delete commands expected in write batch")))
+				log.Panic("only Put/Delete commands expected in write batch")
+				break
+			}
+			rr, err := p.handleRequest(req, kvWB)
+			if err != nil {
+				cb.Done(ErrResp(err))
+				break
+			}
+			resp.Responses = append(resp.Responses, rr)
+		}
 	}
-	raftWB := new(engine_util.WriteBatch)
-	applyState := &rspb.RaftApplyState{
-		AppliedIndex: ents[len(ents)-1].Index,
-	}
-	if err := raftWB.SetMeta(meta.ApplyStateKey(p.regionId), applyState); err != nil {
-		log.Panicf("failed to set apply state")
-	}
-	if err := p.peerStorage.Engines.WriteRaft(raftWB); err != nil {
-		log.Panicf("failed to save apply state")
-	}
+
+	p.peerStorage.SaveApplyResults(ent.Index, kvWB)
+
+	cb.Done(resp)
 }
 
-func (p *peer) handleRequest(req *raft_cmdpb.Request) (*raft_cmdpb.Response, error) {
+func (p *peer) handleRequest(req *raft_cmdpb.Request, wb *engine_util.WriteBatch) (*raft_cmdpb.Response, error) {
 	resp := &raft_cmdpb.Response{CmdType: req.CmdType}
 	kv := p.peerStorage.Engines.Kv
 	switch req.CmdType {
@@ -270,15 +297,11 @@ func (p *peer) handleRequest(req *raft_cmdpb.Request) (*raft_cmdpb.Response, err
 		resp.Get = &raft_cmdpb.GetResponse{Value: v}
 	case raft_cmdpb.CmdType_Put:
 		op := req.Put
-		if err := engine_util.PutCF(kv, op.Cf, op.Key, op.Value); err != nil {
-			return nil, err
-		}
+		wb.SetCF(op.Cf, op.Key, op.Value)
 		resp.Put = &raft_cmdpb.PutResponse{}
 	case raft_cmdpb.CmdType_Delete:
 		op := req.Delete
-		if err := engine_util.DeleteCF(kv, op.Cf, op.Key); err != nil {
-			return nil, err
-		}
+		wb.DeleteCF(op.Cf, op.Key)
 		resp.Delete = &raft_cmdpb.DeleteResponse{}
 	}
 	return resp, nil

@@ -58,7 +58,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				RegionEpoch: d.Region().RegionEpoch,
 				Message:     &mm,
 			}); err != nil {
-				log.Errorf("%s error send to peer %d: %v", d.Tag, msg.To, err)
+				log.Debugf("%s error send to peer %d: %v", d.Tag, msg.To, err)
 			}
 		}
 		if len(rd.CommittedEntries) > 0 {

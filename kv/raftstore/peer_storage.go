@@ -230,6 +230,16 @@ func (ps *PeerStorage) AppliedIndex() uint64 {
 	return ps.applyState.AppliedIndex
 }
 
+func (ps *PeerStorage) SaveApplyResults(index uint64, kvWB *engine_util.WriteBatch) {
+	ps.applyState.AppliedIndex = index
+	if err := kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState); err != nil {
+		log.Panicf("failed to set apply state")
+	}
+	if err := ps.Engines.WriteKV(kvWB); err != nil {
+		log.Panicf("failed to commit applies to state machine")
+	}
+}
+
 func (ps *PeerStorage) validateSnap(snap *eraftpb.Snapshot) bool {
 	idx := snap.GetMetadata().GetIndex()
 	if idx < ps.truncatedIndex() {
