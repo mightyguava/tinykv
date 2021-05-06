@@ -88,6 +88,7 @@ func (d *peerMsgHandler) findProposal(term, index uint64) *proposal {
 			}
 		} else {
 			log.Warnf("%s skipping stale proposal at term %d index %d", d.Tag, p.term, p.index)
+			p.cb.Done(ErrRespStaleCommand(term))
 		}
 	}
 	return nil
