@@ -222,6 +222,7 @@ func (r *Raft) sendAppend(to uint64) {
 	if pr.Next < r.RaftLog.firstIndex {
 		// When the leader has already discarded the next log entry that it needs to send to a follower,
 		// it sends a snapshot instead. §7
+		log.Debugf("%x requesting snapshot to send to %x", r.id, to)
 		snap, err := r.RaftLog.snapshot()
 		if err != nil {
 			if err == ErrSnapshotTemporarilyUnavailable {
@@ -401,7 +402,12 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		}
 	case pb.MessageType_MsgAppendResponse:
 		pr.Match = m.Index
-		pr.Next = max(r.RaftLog.firstIndex, m.Index+1)
+		if m.Reject {
+			// work backwards to find where the logs converge.
+			pr.Next--
+		} else {
+			pr.Next = m.Index + 1
+		}
 		if r.maybeCommit() {
 			r.bcastAppend()
 		} else if pr.Next < r.RaftLog.LastIndex() {
@@ -557,8 +563,10 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	r.electionElapsed = 0
 	last, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, entriesToValue(m.Entries)...)
 	if !ok {
+		log.Debugf("%x rejected append from %x", r.id, m.From)
 		r.send(pb.Message{To: m.From, Reject: true, MsgType: pb.MessageType_MsgAppendResponse})
 	} else {
+		log.Debugf("%x appresp to %x, lastIndex: %d", r.id, m.From, last)
 		r.send(pb.Message{To: m.From, Index: last, MsgType: pb.MessageType_MsgAppendResponse})
 	}
 }
@@ -597,7 +605,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	}
 	sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
 	if r.restore(m.Snapshot) {
-		log.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
+		log.Infof("%x [commit: %d] start restore snapshot [index: %d, term: %d]",
 			r.id, r.RaftLog.committed, sindex, sterm)
 		r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex()})
 	} else {

@@ -252,7 +252,10 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		return 0, errors.New("invalid index for term")
 	}
 	if i == l.firstIndex-1 {
-		return 0, nil
+		if l.hasPendingSnapshot() {
+			return l.pendingSnapshot.Metadata.Index, nil
+		}
+		return l.storage.Term(i)
 	}
 	ent, err := l.slice(i, i+1)
 	if err != nil {

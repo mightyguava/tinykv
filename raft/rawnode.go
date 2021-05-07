@@ -204,7 +204,10 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.CommittedEntries) > 0 {
 		rl.applied = lastIndexOf(rd.CommittedEntries)
 	}
-	rl.pendingSnapshot = nil
+	if !IsEmptySnap(&rd.Snapshot) {
+		rl.pendingSnapshot = nil
+		rl.applied = rd.Snapshot.Metadata.Index
+	}
 	rl.maybeCompact()
 }
 
