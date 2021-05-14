@@ -73,7 +73,11 @@ func newLog(storage Storage) *RaftLog {
 	}
 	ents, err := storage.Entries(firstIndex, lastIndex+1)
 	if err != nil {
-		panic(err)
+		if firstIndex == lastIndex && err == ErrUnavailable {
+			// No new entries were added yet after the snapshot.
+		} else {
+			panic(err)
+		}
 	}
 	return &RaftLog{
 		storage:    storage,
@@ -173,9 +177,14 @@ func (l *RaftLog) maybeCompact() {
 	if err != nil {
 		log.Panicf("error fetching firstIndex from storage: %v", err)
 	}
-	offset := idx - l.entries[0].Index
-	l.entries = l.entries[offset:]
-	l.firstIndex = idx
+	if idx < l.entries[0].Index {
+		// The stored log has more history than the in-memory log, skip compaction
+	} else {
+		// The stored log has less history than the in-memory log, compact to the history kept by the stored log
+		offset := idx - l.entries[0].Index
+		l.entries = l.entries[offset:]
+		l.firstIndex = idx
+	}
 }
 
 // unstableEntries return all the unstable entries
@@ -221,7 +230,19 @@ func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
 	if lo == hi {
 		return nil, nil
 	}
-	return l.entries[lo-l.entries[0].Index : hi-l.entries[0].Index], nil
+	var ents []pb.Entry
+	if lo < l.entries[0].Index {
+		ents = l.entries[:hi-l.entries[0].Index]
+		hi = l.entries[0].Index
+		storeEnts, err := l.storage.Entries(lo, hi)
+		if err != nil {
+			return nil, err
+		}
+		ents = append(storeEnts, ents...)
+		return ents, nil
+	} else {
+		return l.entries[lo-l.entries[0].Index : hi-l.entries[0].Index], nil
+	}
 }
 
 func (l *RaftLog) commit(index uint64) {
